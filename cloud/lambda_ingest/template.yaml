@@ -1,11 +1,17 @@
 AWSTemplateFormatVersion: '2010-09-09'
 Transform: AWS::Serverless-2016-10-31
-Description: Chamber ingest API (telemetry/events) -> Timestream
+Description: Chamber ingest API (telemetry/events) -> DynamoDB or Timestream
 
 Parameters:
   ApiToken:
     Type: String
     NoEcho: true
+  StorageBackend:
+    Type: String
+    Default: dynamodb
+    AllowedValues:
+      - dynamodb
+      - timestream
   TsDatabase:
     Type: String
     Default: chamber
@@ -13,6 +19,12 @@ Parameters:
     Type: String
     Default: telemetry
   TsTableEvents:
+    Type: String
+    Default: events
+  DdbTableTelemetry:
+    Type: String
+    Default: telemetry
+  DdbTableEvents:
     Type: String
     Default: events
 
@@ -34,12 +46,21 @@ Resources:
         - Statement:
             - Effect: Allow
               Action:
+                - dynamodb:PutItem
+                - dynamodb:BatchWriteItem
+                - dynamodb:DescribeTable
                 - timestream:WriteRecords
                 - timestream:DescribeEndpoints
-              Resource: '*'
+              Resource:
+                - !Sub 'arn:aws:dynamodb:${AWS::Region}:${AWS::AccountId}:table/${DdbTableTelemetry}'
+                - !Sub 'arn:aws:dynamodb:${AWS::Region}:${AWS::AccountId}:table/${DdbTableEvents}'
+                - '*'
       Environment:
         Variables:
           API_TOKEN: !Ref ApiToken
+          STORAGE_BACKEND: !Ref StorageBackend
+          DDB_TABLE_TELEMETRY: !Ref DdbTableTelemetry
+          DDB_TABLE_EVENTS: !Ref DdbTableEvents
           TS_DB: !Ref TsDatabase
           TS_TABLE_TELEMETRY: !Ref TsTableTelemetry
           TS_TABLE_EVENTS: !Ref TsTableEvents

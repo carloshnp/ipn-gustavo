@@ -12,7 +12,7 @@
 
 ## Backend-side
 - Lambda logs: no sustained 4xx/5xx spikes.
-- Timestream ingest and query latency stable.
+- DynamoDB write/query latency stable.
 - Streamlit accessible at EC2 `:8501`.
 
 ## Common maintenance
@@ -73,11 +73,13 @@ Actions:
    - `X-Device-Id`
 3. Validate request JSON shape.
 
-## Timestream write errors
+## DynamoDB write errors
 1. Confirm Lambda role permissions:
-   - `timestream:WriteRecords`
-   - `timestream:DescribeEndpoints`
-2. Confirm DB/table names passed in env vars.
+   - `dynamodb:PutItem`
+   - `dynamodb:BatchWriteItem`
+2. Confirm table names passed in env vars:
+   - `DDB_TABLE_TELEMETRY`
+   - `DDB_TABLE_EVENTS`
 
 ## EC2 unreachable
 1. Confirm instance state + status checks.

@@ -3,6 +3,8 @@ param(
   [string]$ProjectPrefix,
   [string]$Region = "us-east-1",
   [string]$KeyPairName,
+  [ValidateSet("dynamodb", "timestream")]
+  [string]$StorageBackend = "dynamodb",
   [switch]$ForceRecreateEc2,
   [switch]$SkipEc2,
   [switch]$DryRun
@@ -10,6 +12,10 @@ param(
 
 Set-StrictMode -Version Latest
 $ErrorActionPreference = "Stop"
+# AWS CLI can write informational output to stderr; avoid treating that as fatal in PowerShell.
+if (Get-Variable -Name PSNativeCommandUseErrorActionPreference -ErrorAction SilentlyContinue) {
+  $global:PSNativeCommandUseErrorActionPreference = $false
+}
 
 function Write-Section([string]$Name) {
   Write-Host ""
@@ -63,45 +69,67 @@ function Prompt-Text([string]$Prompt, [string]$Default = "") {
   }
 }
 
-function Invoke-AwsJson([string[]]$Args) {
-  $all = @($Args + @("--region", $Region, "--output", "json"))
+function Invoke-AwsRaw([string[]]$AllArgs) {
+  $tmpOut = [System.IO.Path]::GetTempFileName()
+  $tmpErr = [System.IO.Path]::GetTempFileName()
+  try {
+    $proc = Start-Process -FilePath "aws" -ArgumentList $AllArgs -NoNewWindow -Wait -PassThru -RedirectStandardOutput $tmpOut -RedirectStandardError $tmpErr
+    $stdout = ""
+    $stderr = ""
+    if (Test-Path $tmpOut) { $stdout = Get-Content -Path $tmpOut -Raw }
+    if (Test-Path $tmpErr) { $stderr = Get-Content -Path $tmpErr -Raw }
+    return [pscustomobject]@{
+      ExitCode = $proc.ExitCode
+      StdOut = $stdout
+      StdErr = $stderr
+    }
+  } finally {
+    Remove-Item -Path $tmpOut,$tmpErr -Force -ErrorAction SilentlyContinue
+  }
+}
+
+function Invoke-AwsJson([string[]]$CliArgs) {
+  $all = @($CliArgs + @("--region", $Region, "--output", "json", "--no-cli-pager"))
   if ($DryRun) {
     Write-Host "[DryRun] aws $($all -join ' ')" -ForegroundColor Yellow
     return $null
   }
-  $out = & aws @all 2>&1
-  if ($LASTEXITCODE -ne 0) {
-    throw "AWS command failed: aws $($all -join ' ')`n$out"
+  $res = Invoke-AwsRaw -AllArgs $all
+  if ($res.ExitCode -ne 0) {
+    throw "AWS command failed: aws $($all -join ' ')`nSTDOUT:`n$($res.StdOut)`nSTDERR:`n$($res.StdErr)"
   }
+  $out = $res.StdOut
   if ([string]::IsNullOrWhiteSpace($out)) { return $null }
   return $out | ConvertFrom-Json
 }
 
-function Invoke-AwsText([string[]]$Args) {
-  $all = @($Args + @("--region", $Region, "--output", "text"))
+function Invoke-AwsText([string[]]$CliArgs) {
+  $all = @($CliArgs + @("--region", $Region, "--output", "text", "--no-cli-pager"))
   if ($DryRun) {
     Write-Host "[DryRun] aws $($all -join ' ')" -ForegroundColor Yellow
     return ""
   }
-  $out = & aws @all 2>&1
-  if ($LASTEXITCODE -ne 0) {
-    throw "AWS command failed: aws $($all -join ' ')`n$out"
+  $res = Invoke-AwsRaw -AllArgs $all
+  if ($res.ExitCode -ne 0) {
+    throw "AWS command failed: aws $($all -join ' ')`nSTDOUT:`n$($res.StdOut)`nSTDERR:`n$($res.StdErr)"
   }
-  return ($out | Out-String).Trim()
+  $out = $res.StdOut
+  return $out.Trim()
 }
 
-function Invoke-AwsNoOut([string[]]$Args, [switch]$IgnoreDuplicateRule) {
-  $all = @($Args + @("--region", $Region))
+function Invoke-AwsNoOut([string[]]$CliArgs, [switch]$IgnoreDuplicateRule) {
+  $all = @($CliArgs + @("--region", $Region, "--no-cli-pager"))
   if ($DryRun) {
     Write-Host "[DryRun] aws $($all -join ' ')" -ForegroundColor Yellow
     return
   }
-  $out = & aws @all 2>&1
-  if ($LASTEXITCODE -ne 0) {
+  $res = Invoke-AwsRaw -AllArgs $all
+  $out = "$($res.StdOut)`n$($res.StdErr)"
+  if ($res.ExitCode -ne 0) {
     if ($IgnoreDuplicateRule -and ($out -match "InvalidPermission\.Duplicate")) {
       return
     }
-    throw "AWS command failed: aws $($all -join ' ')`n$out"
+    throw "AWS command failed: aws $($all -join ' ')`nSTDOUT:`n$($res.StdOut)`nSTDERR:`n$($res.StdErr)"
   }
 }
 
@@ -139,6 +167,40 @@ function Ensure-TimestreamTable([string]$DbName, [string]$TableName) {
       "--database-name", $DbName,
       "--table-name", $TableName,
       "--retention-properties", "MemoryStoreRetentionPeriodInHours=72,MagneticStoreRetentionPeriodInDays=365"
+    )
+  }
+}
+
+function Ensure-DynamoTable([string]$TableName) {
+  Write-Host "Ensuring DynamoDB table: $TableName"
+  $exists = $true
+  try {
+    Invoke-AwsNoOut @("dynamodb", "describe-table", "--table-name", $TableName)
+  } catch {
+    $exists = $false
+  }
+  if (-not $exists) {
+    Invoke-AwsNoOut @(
+      "dynamodb", "create-table",
+      "--table-name", $TableName,
+      "--attribute-definitions", "AttributeName=device_id,AttributeType=S" "AttributeName=sk,AttributeType=S",
+      "--key-schema", "AttributeName=device_id,KeyType=HASH" "AttributeName=sk,KeyType=RANGE",
+      "--billing-mode", "PAY_PER_REQUEST"
+    )
+  }
+
+  Invoke-AwsNoOut @("dynamodb", "wait", "table-exists", "--table-name", $TableName)
+
+  $ttl = Invoke-AwsJson @("dynamodb", "describe-time-to-live", "--table-name", $TableName)
+  $status = ""
+  if ($ttl -and $ttl.TimeToLiveDescription -and $ttl.TimeToLiveDescription.TimeToLiveStatus) {
+    $status = [string]$ttl.TimeToLiveDescription.TimeToLiveStatus
+  }
+  if ($status -ne "ENABLED" -and $status -ne "ENABLING") {
+    Invoke-AwsNoOut @(
+      "dynamodb", "update-time-to-live",
+      "--table-name", $TableName,
+      "--time-to-live-specification", "Enabled=true,AttributeName=expires_at"
     )
   }
 }
@@ -215,7 +277,10 @@ function New-UserDataFile(
   [string]$OutPath,
   [string]$DashboardAppPath,
   [string]$RequirementsPath,
+  [string]$StorageBackend,
   [string]$AwsRegion,
+  [string]$DdbTele,
+  [string]$DdbEvt,
   [string]$TsDb,
   [string]$TsTele,
   [string]$TsEvt,
@@ -229,7 +294,10 @@ function New-UserDataFile(
   $reqB64 = [Convert]::ToBase64String([Text.Encoding]::UTF8.GetBytes($req))
 
   $content = $tpl
+  $content = $content.Replace("__STORAGE_BACKEND__", $StorageBackend)
   $content = $content.Replace("__AWS_REGION__", $AwsRegion)
+  $content = $content.Replace("__DDB_TABLE_TELEMETRY__", $DdbTele)
+  $content = $content.Replace("__DDB_TABLE_EVENTS__", $DdbEvt)
   $content = $content.Replace("__TS_DB__", $TsDb)
   $content = $content.Replace("__TS_TABLE_TELEMETRY__", $TsTele)
   $content = $content.Replace("__TS_TABLE_EVENTS__", $TsEvt)
@@ -263,7 +331,7 @@ function Ensure-EC2Instance(
   if ($ForceRecreate -and $instanceId -and $instanceId -ne "None") {
     Invoke-AwsNoOut @("ec2", "terminate-instances", "--instance-ids", $instanceId)
     if (-not $DryRun) {
-      & aws ec2 wait instance-terminated --instance-ids $instanceId --region $Region
+      Invoke-AwsNoOut @("ec2", "wait", "instance-terminated", "--instance-ids", $instanceId)
       $instanceId = ""
     }
   }
@@ -303,8 +371,8 @@ function Ensure-EC2Instance(
   }
 
   if (-not $DryRun) {
-    & aws ec2 wait instance-running --instance-ids $instanceId --region $Region
-    & aws ec2 wait instance-status-ok --instance-ids $instanceId --region $Region
+    Invoke-AwsNoOut @("ec2", "wait", "instance-running", "--instance-ids", $instanceId)
+    Invoke-AwsNoOut @("ec2", "wait", "instance-status-ok", "--instance-ids", $instanceId)
   }
 
   return $instanceId
@@ -379,7 +447,6 @@ $LambdaDir = Join-Path $ProjectRoot "cloud\lambda_ingest"
 $DashboardDir = Join-Path $ProjectRoot "dashboard"
 $TemplatePath = Join-Path $ScriptRoot "streamlit_user_data.sh.tpl"
 $UserDataOut = Join-Path $env:TEMP ("chamber-user-data-" + $ProjectPrefix + ".sh")
-$PolicyPath = Join-Path $ScriptRoot "policies\ec2_timestream_read_policy.json"
 $DashboardAppPath = Join-Path $DashboardDir "streamlit_app.py"
 $DashboardReqPath = Join-Path $DashboardDir "requirements.txt"
 
@@ -390,13 +457,27 @@ $stackName = "$ProjectPrefix-ingest"
 $ec2Name = "$ProjectPrefix-streamlit"
 $roleName = "$ProjectPrefix-streamlit-role"
 $profileName = "$ProjectPrefix-streamlit-profile"
-$policyName = "$ProjectPrefix-streamlit-timestream-read"
 $sgName = "$ProjectPrefix-streamlit-sg"
 
-Write-Section "Timestream"
-Ensure-TimestreamDatabase -DbName $dbName
-Ensure-TimestreamTable -DbName $dbName -TableName $teleTable
-Ensure-TimestreamTable -DbName $dbName -TableName $evtTable
+$StorageBackend = $StorageBackend.ToLowerInvariant()
+if ($StorageBackend -eq "dynamodb") {
+  $PolicyPath = Join-Path $ScriptRoot "policies\ec2_dynamodb_read_policy.json"
+  $policyName = "$ProjectPrefix-streamlit-dynamodb-read"
+} else {
+  $PolicyPath = Join-Path $ScriptRoot "policies\ec2_timestream_read_policy.json"
+  $policyName = "$ProjectPrefix-streamlit-timestream-read"
+}
+
+if ($StorageBackend -eq "dynamodb") {
+  Write-Section "DynamoDB"
+  Ensure-DynamoTable -TableName $teleTable
+  Ensure-DynamoTable -TableName $evtTable
+} else {
+  Write-Section "Timestream"
+  Ensure-TimestreamDatabase -DbName $dbName
+  Ensure-TimestreamTable -DbName $dbName -TableName $teleTable
+  Ensure-TimestreamTable -DbName $dbName -TableName $evtTable
+}
 
 Write-Section "Lambda + API (SAM)"
 if ($DryRun) {
@@ -419,6 +500,9 @@ if ($DryRun) {
       --region $Region `
       --parameter-overrides `
       "ApiToken=$ApiToken" `
+      "StorageBackend=$StorageBackend" `
+      "DdbTableTelemetry=$teleTable" `
+      "DdbTableEvents=$evtTable" `
       "TsDatabase=$dbName" `
       "TsTableTelemetry=$teleTable" `
       "TsTableEvents=$evtTable"
@@ -449,7 +533,10 @@ if (-not $SkipEc2) {
     -OutPath $UserDataOut `
     -DashboardAppPath $DashboardAppPath `
     -RequirementsPath $DashboardReqPath `
+    -StorageBackend $StorageBackend `
     -AwsRegion $Region `
+    -DdbTele $teleTable `
+    -DdbEvt $evtTable `
     -TsDb $dbName `
     -TsTele $teleTable `
     -TsEvt $evtTable `
@@ -498,11 +585,20 @@ Write-Host "CFG TEST"
 Write-Host "CFG SHOW"
 
 Write-Section "Summary"
+Write-Host "Storage backend: $StorageBackend"
 Write-Host "Region: $Region"
 Write-Host "Stack: $stackName"
 Write-Host "Lambda: $lambdaName"
 Write-Host "HttpApiId: $httpApiId"
 Write-Host "ApiUrl: $apiUrl"
+if ($StorageBackend -eq "dynamodb") {
+  Write-Host "DynamoDB telemetry table: $teleTable"
+  Write-Host "DynamoDB events table: $evtTable"
+} else {
+  Write-Host "Timestream DB: $dbName"
+  Write-Host "Timestream telemetry table: $teleTable"
+  Write-Host "Timestream events table: $evtTable"
+}
 if (-not $SkipEc2) {
   Write-Host "EC2 instance: $instanceId"
   Write-Host "Dashboard URL: http://$publicIp:8501"
@@ -519,6 +615,9 @@ $receipt = [ordered]@{
   api_url = $apiUrl
   api_host = $apiHost
   api_path = $apiPath
+  storage_backend = $StorageBackend
+  ddb_table_telemetry = $teleTable
+  ddb_table_events = $evtTable
   timestream_db = $dbName
   timestream_table_telemetry = $teleTable
   timestream_table_events = $evtTable

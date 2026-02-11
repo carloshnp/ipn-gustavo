@@ -1,4 +1,4 @@
-# Lambda Ingest (API Gateway -> Timestream)
+# Lambda Ingest (API Gateway -> DynamoDB/Timestream)
 
 ## Routes
 - `POST /v1/telemetry/batch`
@@ -11,6 +11,9 @@
 
 ## Environment variables
 - `API_TOKEN`
+- `STORAGE_BACKEND` (`dynamodb` or `timestream`)
+- `DDB_TABLE_TELEMETRY`
+- `DDB_TABLE_EVENTS`
 - `TS_DB`
 - `TS_TABLE_TELEMETRY`
 - `TS_TABLE_EVENTS`
@@ -22,5 +25,6 @@ sam deploy --guided
 ```
 
 ## Notes
-- This handler treats duplicates as idempotent by writing with `Version=line_index`.
+- DynamoDB path is idempotent by deterministic key (`device_id` + `sk`).
+- Timestream path keeps record-version semantics.
 - Keep API token private and rotate periodically.

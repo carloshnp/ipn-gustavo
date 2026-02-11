@@ -17,7 +17,7 @@ This guide runs the complete SD-first cloud stack in one execution using PowerSh
 - IAM permissions for:
   - CloudFormation, Lambda, API Gateway, IAM
   - EC2, SSM
-  - Timestream write/query admin operations
+  - DynamoDB create/read/write admin operations
 
 ## Firmware assumptions
 - Mega firmware already flashed with `CFG` serial command support.
@@ -25,8 +25,7 @@ This guide runs the complete SD-first cloud stack in one execution using PowerSh
 - SD is always primary persistence.
 
 ## 2. What the one-shot script creates
-- Timestream DB and tables:
-  - `${prefix}-chamber`
+- DynamoDB tables:
   - `${prefix}-telemetry`
   - `${prefix}-events`
 - SAM stack `${prefix}-ingest` with:
@@ -54,6 +53,7 @@ Optional flags:
 
 ```powershell
 .\deploy\one_shot_deploy.ps1 -ProjectPrefix chamber-prod -Region us-east-1 -KeyPairName mykey
+.\deploy\one_shot_deploy.ps1 -StorageBackend dynamodb
 .\deploy\one_shot_deploy.ps1 -SkipEc2
 .\deploy\one_shot_deploy.ps1 -ForceRecreateEc2
 .\deploy\one_shot_deploy.ps1 -DryRun
@@ -91,12 +91,9 @@ Expected: HTTP `200`.
 - Open Lambda log group for ingest function.
 - Confirm no auth/parse/write errors.
 
-## Timestream sample query
-```sql
-SELECT *
-FROM "<prefix>-chamber"."<prefix>-telemetry"
-WHERE time > ago(1h)
-LIMIT 20
+## DynamoDB sample validation
+```powershell
+aws dynamodb scan --table-name <prefix>-telemetry --max-items 20 --region us-east-1
 ```
 
 ## 5. Validate dashboard
@@ -160,9 +157,12 @@ On device:
 - Check IAM permissions
 - Retry `sam build` and `sam deploy` in `cloud/lambda_ingest`
 
-## Timestream permission errors
-- Confirm Lambda role includes `WriteRecords` + `DescribeEndpoints`
-- Confirm EC2 role includes `Select` + `DescribeEndpoints`
+## DynamoDB permission errors
+- Confirm Lambda role includes `dynamodb:PutItem` + `dynamodb:BatchWriteItem`
+- Confirm EC2 role includes `dynamodb:Query` + `dynamodb:Scan`
+- Confirm table names passed to Lambda env vars:
+  - `DDB_TABLE_TELEMETRY`
+  - `DDB_TABLE_EVENTS`
 
 ## EC2 dashboard not reachable
 - Check instance is running and status checks are OK
@@ -184,9 +184,8 @@ aws cloudformation delete-stack --stack-name <prefix>-ingest --region us-east-1
   - `<prefix>-streamlit-profile`
   - `<prefix>-streamlit-role`
 
-## Optional Timestream cleanup
+## Optional DynamoDB cleanup
 ```powershell
-aws timestream-write delete-table --database-name <prefix>-chamber --table-name <prefix>-telemetry --region us-east-1
-aws timestream-write delete-table --database-name <prefix>-chamber --table-name <prefix>-events --region us-east-1
-aws timestream-write delete-database --database-name <prefix>-chamber --region us-east-1
+aws dynamodb delete-table --table-name <prefix>-telemetry --region us-east-1
+aws dynamodb delete-table --table-name <prefix>-events --region us-east-1
 ```
