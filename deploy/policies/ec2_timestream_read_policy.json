@@ -1,0 +1,15 @@
+{
+  "Version": "2012-10-17",
+  "Statement": [
+    {
+      "Sid": "TimestreamRead",
+      "Effect": "Allow",
+      "Action": [
+        "timestream:DescribeEndpoints",
+        "timestream:Select",
+        "timestream:CancelQuery"
+      ],
+      "Resource": "*"
+    }
+  ]
+}

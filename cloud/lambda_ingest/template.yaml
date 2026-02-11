@@ -1,0 +1,66 @@
+AWSTemplateFormatVersion: '2010-09-09'
+Transform: AWS::Serverless-2016-10-31
+Description: Chamber ingest API (telemetry/events) -> Timestream
+
+Parameters:
+  ApiToken:
+    Type: String
+    NoEcho: true
+  TsDatabase:
+    Type: String
+    Default: chamber
+  TsTableTelemetry:
+    Type: String
+    Default: telemetry
+  TsTableEvents:
+    Type: String
+    Default: events
+
+Resources:
+  IngestApi:
+    Type: AWS::Serverless::HttpApi
+    Properties:
+      StageName: v1
+
+  IngestFunction:
+    Type: AWS::Serverless::Function
+    Properties:
+      Runtime: python3.12
+      Handler: app.lambda_handler
+      CodeUri: .
+      Timeout: 15
+      MemorySize: 256
+      Policies:
+        - Statement:
+            - Effect: Allow
+              Action:
+                - timestream:WriteRecords
+                - timestream:DescribeEndpoints
+              Resource: '*'
+      Environment:
+        Variables:
+          API_TOKEN: !Ref ApiToken
+          TS_DB: !Ref TsDatabase
+          TS_TABLE_TELEMETRY: !Ref TsTableTelemetry
+          TS_TABLE_EVENTS: !Ref TsTableEvents
+      Events:
+        Telemetry:
+          Type: HttpApi
+          Properties:
+            ApiId: !Ref IngestApi
+            Path: /telemetry/batch
+            Method: POST
+        Events:
+          Type: HttpApi
+          Properties:
+            ApiId: !Ref IngestApi
+            Path: /events/batch
+            Method: POST
+
+Outputs:
+  ApiUrl:
+    Value: !Sub 'https://${IngestApi}.execute-api.${AWS::Region}.amazonaws.com/v1'
+  FunctionName:
+    Value: !Ref IngestFunction
+  HttpApiId:
+    Value: !Ref IngestApi
